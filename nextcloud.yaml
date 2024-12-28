@@ -1,0 +1,510 @@
+#############################
+#
+# Minio
+#
+#############################
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-pvc
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi # Adjust based on your requirements
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  labels:
+    app: minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+      - name: minio
+        image: quay.io/minio/minio:latest
+        args:
+        - server
+        - /data
+        env:
+        - name: MINIO_ACCESS_KEY
+          value: minioadmin # Replace with your desired access key
+        - name: MINIO_SECRET_KEY
+          value: minioadmin123 # Replace with your desired secret key
+        ports:
+        - containerPort: 9000
+        volumeMounts:
+        - name: minio-data
+          mountPath: /data
+      volumes:
+      - name: minio-data
+        emptyDir: {} # Replace with persistent storage for production
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+spec:
+  selector:
+    app: minio
+  ports:
+  - protocol: TCP
+    port: 9000
+    targetPort: 9000
+  type: ClusterIP
+---
+###########################
+#
+#
+# Backup job
+#
+#
+###########################
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: minio-backup
+spec:
+  schedule: "0 2 * * *" # Runs daily at 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: backup
+            image: busybox # Using a lightweight image for simplicity
+            command:
+            - sh
+            - -c
+            - |
+              echo "Creating backup archive..."
+              tar -czvf /backup/minio-backup-$(date +%Y%m%d).tar.gz /data
+              echo "Cleaning up old backups..."
+              find /backup -type f -mtime +7 -name "minio-backup-*.tar.gz" -exec rm {} \;
+              echo "Backup successfully written to /mnt/external-disk."
+            volumeMounts:
+            - name: minio-data
+              mountPath: /data # Mount Minio data
+            - name: external-disk
+              mountPath: /backup # Mount the directory on the host
+          restartPolicy: OnFailure
+          volumes:
+          - name: minio-data
+            persistentVolumeClaim:
+              claimName: minio-pvc # PVC for Minio data
+          - name: external-disk
+            hostPath:
+              path: /mnt/external-disk # Path on the host VM
+              type: Directory # Ensure this is a directory on the host
+---
+##########################
+#
+# PostgreSQL Deployment
+#
+##########################
+# To backup this database
+#
+# Get a list of pods of db type
+#
+#   kubectl get pods -l app=postgres
+#
+# Perform the actual backup
+#
+#   kubectl exec -it postgres-69bdb56bb8-m5gq2 -- pg_dump -U nextclouduser nextcloud > nextcloud-db-backup.sql
+#
+# To restore
+#
+# 1. Move the db to the pod
+#
+#   kubectl cp ./nextcloud-db-backup.sql postgres-69bdb56bb8-m5gq2:/tmp/nextcloud-db-backup.sql
+#
+# 2. Restore the db
+#
+#   kubectl exec -it postgres-69bdb56bb8-m5gq2 -- bash -c "PGPASSWORD=securepassword psql -U nextclouduser nextcloud < /tmp/nextcloud-db-backup.sql"
+#
+# 3. Optional :
+#   3.1. In case you have to drop the db
+#
+#     kubectl exec -it postgres-69bdb56bb8-m5gq2 -- bash -c "PGPASSWORD=securepassword psql -U nextclouduser -d postgres -c 'DROP DATABASE nextcloud;'"   
+#
+#   3.2. Recreate the database
+#
+#     kubectl exec -it postgres-69bdb56bb8-m5gq2 -- bash -c "PGPASSWORD=securepassword psql -U nextclouduser -d postgres -c 'CREATE DATABASE nextcloud ENCODING ''UTF8'';'"                            
+#
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels:
+    app: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15 # Use the latest stable PostgreSQL version or specify a specific version
+        ports:
+        - containerPort: 5432 # PostgreSQL default port
+        env:
+        - name: POSTGRES_DB
+          value: nextcloud # Name of the database
+        - name: POSTGRES_USER
+          value: nextclouduser # Database username
+        - name: POSTGRES_PASSWORD
+          value: securepassword # Database password (change this in production)
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: postgres-data
+        emptyDir: {} # Temporary storage for testing; replace with persistent storage in production
+---
+# PostgreSQL Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+  - protocol: TCP
+    port: 5432
+    targetPort: 5432
+  type: ClusterIP
+---
+########################
+#
+# Nextcloud Deployment
+#
+########################
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: php-fpm-config
+  namespace: default
+data:
+  php-fpm.conf: |
+    [www]
+    pm = dynamic
+    pm.max_children = 120
+    pm.start_servers = 12
+    pm.min_spare_servers = 6
+    pm.max_spare_servers = 18
+---
+# Nextcloud Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nextcloud
+  labels:
+    app: nextcloud
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nextcloud
+  template:
+    metadata:
+      labels:
+        app: nextcloud
+    spec:
+      containers:
+      - name: occ-runner
+        image: nextcloud:28
+        command:
+        - sh
+        - -c
+        - |
+          # apt update && apt install -y smbclient
+          echo "Waiting for Nextcloud to initialize...";
+          timeout=300  # Timeout in seconds (5 minutes)
+          elapsed=0
+          interval=5  # Check every 5 seconds
+
+          while [ ! -f /var/www/html/occ ]; do
+            if [ "$elapsed" -ge "$timeout" ]; then
+              echo "Timeout reached: Nextcloud did not initialize within $timeout seconds."
+              exit 1
+            fi
+            echo "Nextcloud not ready yet... Retrying in $interval seconds."
+  
+            sleep $interval
+            elapsed=$((elapsed + interval))
+          done
+
+          echo "Found OCC. Waiting for nextcloud to be installed..."
+          while true; do
+            # Check if Nextcloud is installed
+            if su -s /bin/sh www-data -c "php /var/www/html/occ status" | grep -q "installed: true"; then
+              echo "Nextcloud is installed!"
+              break
+            fi
+
+            # Check if we've exceeded the timeout
+            if [ "$elapsed" -ge "$timeout" ]; then
+              echo "Timeout reached: Nextcloud is not installed after $timeout seconds."
+              exit 1
+            fi
+
+            echo "Nextcloud is not yet installed. Retrying in $interval seconds..."
+            sleep $interval
+            elapsed=$((elapsed + interval))
+          done
+          echo "Nextcloud initialized, running occ commands...";
+          cd /var/www/html
+          su -s /bin/sh www-data -c "php occ app:enable files_external"
+          su -s /bin/sh www-data -c 'php occ config:system:set trusted_domains 2 --value="10.244.0.1"'
+          su -s /bin/sh www-data -c 'php occ config:system:set trusted_domains 3 --value="nextcloud.abd"'
+          echo "Configure Minio..."
+          su -s /bin/sh www-data -c "php /var/www/html/occ files_external:create 'MinIO' amazons3 amazons3::accesskey \
+            -c bucket=nextcloud \
+            -c key=minioadmin \
+            -c secret=minioadmin123 \
+            -c hostname=minio \
+            -c port=9000 \
+            -c use_ssl=false \
+            -c region=us-east-1 \
+            -c use_path_style=true"
+          echo "Configuring Collabora Online integration...";
+          su -s /bin/sh www-data -c "php /var/www/html/occ app:enable richdocuments"
+          #su -s /bin/sh www-data -c "php -d memory_limit=512M occ app:install richdocumentscode"
+          su -s /bin/sh www-data -c "php /var/www/html/occ config:system:set richdocuments wopi_url --value=\"http://collabora.abd/\""
+          su -s /bin/sh www-data -c "php /var/www/html/occ config:system:set richdocuments public_wopi_url --value=\"http://collabora.abd/\""
+          su -s /bin/sh www-data -c "php /var/www/html/occ config:app:set files max_chunk_size --value=\"104857600\""
+
+          sleep infinity
+        volumeMounts:
+        - name: nextcloud-data
+          mountPath: /var/www/html
+      - name: nextcloud
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "2"
+        image: nextcloud:28
+        ports:
+        - containerPort: 80
+        env:
+        - name: NEXTCLOUD_ADMIN_USER
+          value: abdullah
+        - name: NEXTCLOUD_ADMIN_PASSWORD
+          value: abdullah
+        - name: NEXTCLOUD_AUTOINSTALL_APPS
+          value: files_external
+        - name: POSTGRES_HOST
+          value: postgres # Hostname of the PostgreSQL service
+        - name: POSTGRES_DB
+          value: nextcloud # Database name
+        - name: POSTGRES_USER
+          value: nextclouduser # Database username
+        - name: POSTGRES_PASSWORD
+          value: securepassword # Database password
+        - name: NEXTCLOUD_TRUSTED_DOMAINS
+          value: nextcloud.abd # Replace with your actual domain
+        - name: PHP_UPLOAD_LIMIT
+          value: "10G" # Set the maximum upload size to 10GB
+        # - name: OBJECTSTORE_S3_BUCKET
+        #   value: nextcloud
+        # - name: OBJECTSTORE_S3_REGION
+        #   value: us-east-1
+        # - name: OBJECTSTORE_S3_HOST
+        #   value: minio
+        # - name: OBJECTSTORE_S3_KEY
+        #   value: minioadmin
+        # - name: OBJECTSTORE_S3_SECRET
+        #   value: minioadmin123
+        # - name: OBJECTSTORE_S3_PORT
+        #   value: "9000"
+        # - name: OBJECTSTORE_S3_SSL
+        #   value: "false"
+        # - name: OBJECTSTORE_S3_USEPATH_STYLE
+        #   value: "true"
+        - name: PHP_OPCACHE_ENABLE
+          value: "1"
+        - name: PHP_OPCACHE_MEMORY_CONSUMPTION
+          value: "128"
+        - name: PHP_OPCACHE_MAX_ACCELERATED_FILES
+          value: "10000"
+        volumeMounts:
+        - name: nextcloud-data
+          mountPath: /var/www/html
+        - name: php-fpm-config
+          mountPath: /usr/local/etc/php-fpm.d/ # Replace with your PHP-FPM config directory
+          subPath: php-fpm.conf
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - |
+              response=$(curl -o /dev/null -s -w "%{http_code}" http://localhost/status.php)
+              if [ "$response" -eq 200 ]; then
+                exit 0
+              else
+                exit 1
+              fi
+          initialDelaySeconds: 10  # Delay before the first check
+          periodSeconds: 10        # Check every 10 seconds
+          timeoutSeconds: 5        # Timeout for each check
+          successThreshold: 1      # Number of successes before marking as ready
+          failureThreshold: 3
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - |
+              response=$(curl -o /dev/null -s -w "%{http_code}" http://localhost/status.php)
+              if [ "$response" -eq 200 ]; then
+                exit 0
+              else
+                exit 1
+              fi
+          initialDelaySeconds: 30  # Delay before the first liveness check
+          periodSeconds: 30        # Check every 30 seconds
+          timeoutSeconds: 5        # Timeout for each check
+          failureThreshold: 3      # Number of failures before restarting
+      volumes:
+      - name: nextcloud-data
+        emptyDir: {} # Temporary storage for testing purposes
+      - name: php-fpm-config
+        configMap:
+          name: php-fpm-config
+
+---
+# Nextcloud Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: nextcloud
+spec:
+  selector:
+    app: nextcloud
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+---
+# Collabora
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: collabora
+  labels:
+    app: collabora
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: collabora
+  template:
+    metadata:
+      labels:
+        app: collabora
+    spec:
+      containers:
+      - name: collabora
+        image: collabora/code:latest
+        ports:
+        - containerPort: 9980
+        env:
+        - name: domain
+          value: "nextcloud\\.abd" # Replace with your Nextcloud domain (escaped for regex)
+        - name: server_name
+          value: "collabora.abd" # Replace with your Collabora domain
+        - name: username
+          value: "admin" # Optional: Collabora admin username
+        - name: password
+          value: "adminpassword" # Optional: Collabora admin password
+        - name: dictionaries
+          value: "en_US de_DE" # Optional: Supported dictionaries
+        - name: extra_params
+          value: "--o:ssl.enable=false" # Disable SSL/TLS in Collabora
+
+---
+# Collabora service
+apiVersion: v1
+kind: Service
+metadata:
+  name: collabora
+spec:
+  selector:
+    app: collabora
+  ports:
+  - protocol: TCP
+    port: 9980
+    targetPort: 9980
+  type: ClusterIP
+---
+# Nextcloud Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nextcloud-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m" # Allow uploads up to 10GB
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/use-http2: "true"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/enable-gzip: "true"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      gzip on;
+      gzip_types text/plain application/json application/javascript text/css text/xml application/xml application/xml+rss text/javascript image/svg+xml;
+      gzip_proxied any;
+      gzip_comp_level 6;
+spec:
+  rules:
+  - host: nextcloud.abd # Replace this with your actual domain or subdomain
+    http:
+      paths:
+      - pathType: Prefix
+        path: /
+        backend:
+          service:
+            name: nextcloud
+            port:
+              number: 80
+# Collabora Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: collabora-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m" # Allow uploads up to 10GB
+spec:
+  rules:
+  - host: collabora.abd # Replace with your domain or subdomain
+    http:
+      paths:
+      - pathType: Prefix
+        path: /
+        backend:
+          service:
+            name: collabora
+            port:
+              number: 9980

@@ -3,16 +3,6 @@
 # Minio
 #
 #############################
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: minio-pvc
-spec:
-  accessModes:
-  - ReadWriteOnce
-  resources:
-    requests:
-      storage: 2Gi # Adjust based on your requirements
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -48,7 +38,9 @@ spec:
           mountPath: /data
       volumes:
       - name: minio-data
-        emptyDir: {} # Replace with persistent storage for production
+        hostPath:
+          path: /mnt/external-disk/minio-data # Host path to use for Nextcloud data
+          type: DirectoryOrCreate # Create the directory if it doesn't exist
 ---
 apiVersion: v1
 kind: Service
@@ -73,7 +65,7 @@ spec:
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: minio-backup
+  name: minio-postgres-backup
 spec:
   schedule: "0 2 * * *" # Runs daily at 2 AM
   jobTemplate:
@@ -82,30 +74,52 @@ spec:
         spec:
           containers:
           - name: backup
-            image: busybox # Using a lightweight image for simplicity
+            image: postgres:15 # Use the PostgreSQL image for pg_dump
+            env: # Environment variables for connecting to PostgreSQL
+            - name: POSTGRES_DB
+              value: nextcloud # Database name
+            - name: POSTGRES_USER
+              value: nextclouduser # Database username
+            - name: POSTGRES_PASSWORD
+              value: securepassword # Database password
             command:
             - sh
             - -c
             - |
-              echo "Creating backup archive..."
-              tar -czvf /backup/minio-backup-$(date +%Y%m%d).tar.gz /data
-              echo "Cleaning up old backups..."
-              find /backup -type f -mtime +7 -name "minio-backup-*.tar.gz" -exec rm {} \;
-              echo "Backup successfully written to /mnt/external-disk."
+              echo "Starting backup process..."
+
+              # Step 1: Delete any existing backups
+              echo "Deleting existing backup archives..."
+              rm -f /backup/full-backup-*.tar.gz
+              
+              # Step 2: Create a PostgreSQL dump
+              echo "Creating PostgreSQL backup..."
+              PGPASSWORD=$POSTGRES_PASSWORD pg_dump -U $POSTGRES_USER -h postgres -d $POSTGRES_DB > /backup/nextcloud-db-backup.sql
+
+              # Step 3: Create a compressed archive of Minio data and the PostgreSQL dump
+              echo "Creating new backup archive..."
+              tar -czvf /backup/full-backup-$(date +%Y%m%d).tar.gz /data /backup/nextcloud-db-backup.sql
+
+              # Step 4: Cleanup temporary database dump file
+              echo "Cleaning up temporary database dump..."
+              rm -f /backup/nextcloud-db-backup.sql
+
+              echo "Backup process completed successfully."
             volumeMounts:
-            - name: minio-data
-              mountPath: /data # Mount Minio data
             - name: external-disk
-              mountPath: /backup # Mount the directory on the host
+              mountPath: /data # Mount Minio data
+            - name: external-backup-disk
+              mountPath: /backup # Mount the directory for backups
           restartPolicy: OnFailure
           volumes:
-          - name: minio-data
-            persistentVolumeClaim:
-              claimName: minio-pvc # PVC for Minio data
           - name: external-disk
             hostPath:
-              path: /mnt/external-disk # Path on the host VM
-              type: Directory # Ensure this is a directory on the host
+              path: /mnt/external-disk # Path on the host VM where Minio data is stored
+              type: Directory
+          - name: external-backup-disk
+            hostPath:
+              path: /mnt/external-backup-disk # Path on the host VM for storing backups
+              type: Directory
 ---
 ##########################
 #
@@ -175,7 +189,19 @@ spec:
           mountPath: /var/lib/postgresql/data
       volumes:
       - name: postgres-data
-        emptyDir: {} # Temporary storage for testing; replace with persistent storage in production
+        persistentVolumeClaim:
+          claimName: postgres-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
 ---
 # PostgreSQL Service
 apiVersion: v1
@@ -190,25 +216,6 @@ spec:
     port: 5432
     targetPort: 5432
   type: ClusterIP
----
-########################
-#
-# Nextcloud Deployment
-#
-########################
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: php-fpm-config
-  namespace: default
-data:
-  php-fpm.conf: |
-    [www]
-    pm = dynamic
-    pm.max_children = 120
-    pm.start_servers = 12
-    pm.min_spare_servers = 6
-    pm.max_spare_servers = 18
 ---
 # Nextcloud Deployment
 apiVersion: apps/v1
@@ -229,7 +236,7 @@ spec:
     spec:
       containers:
       - name: occ-runner
-        image: nextcloud:28
+        image: nextcloud:30
         command:
         - sh
         - -c
@@ -287,13 +294,22 @@ spec:
           echo "Configuring Collabora Online integration...";
           su -s /bin/sh www-data -c "php /var/www/html/occ app:enable richdocuments"
           #su -s /bin/sh www-data -c "php -d memory_limit=512M occ app:install richdocumentscode"
-          su -s /bin/sh www-data -c "php /var/www/html/occ config:system:set richdocuments wopi_url --value=\"http://collabora.abd/\""
-          su -s /bin/sh www-data -c "php /var/www/html/occ config:system:set richdocuments public_wopi_url --value=\"http://collabora.abd/\""
+          su -s /bin/sh www-data -c "php /var/www/html/occ config:app:set richdocuments public_wopi_url --value=\"http://collabora.abd/\""
+          su -s /bin/sh www-data -c "php /var/www/html/occ config:app:set richdocuments wopi_url --value=\"http://collabora.abd/\""
+          su -s /bin/sh www-data -c "php /var/www/html/occ config:app:set richdocuments disable_certificate_verification --value=\"true\""
+          su -s /bin/sh www-data -c "php /var/www/html/occ richdocuments:activate-config"
+          su -s /bin/sh www-data -c "php /var/www/html/occ app:install imageconverter"
+          su -s /bin/sh www-data -c "php /var/www/html/occ app:install calendar"
+          su -s /bin/sh www-data -c "php /var/www/html/occ app:install music"
+          su -s /bin/sh www-data -c "php /var/www/html/occ app:install spreed"
+          su -s /bin/sh www-data -c "php /var/www/html/occ app:install collectives"
+          su -s /bin/sh www-data -c "php /var/www/html/occ app:install deck"
+          su -s /bin/sh www-data -c "php /var/www/html/occ app:install snappymail"
           su -s /bin/sh www-data -c "php /var/www/html/occ config:app:set files max_chunk_size --value=\"104857600\""
 
           sleep infinity
         volumeMounts:
-        - name: nextcloud-data
+        - name: nextcloud-root
           mountPath: /var/www/html
       - name: nextcloud
         resources:
@@ -303,7 +319,7 @@ spec:
           limits:
             memory: "1Gi"
             cpu: "2"
-        image: nextcloud:28
+        image: nextcloud:30
         ports:
         - containerPort: 80
         env:
@@ -348,11 +364,8 @@ spec:
         - name: PHP_OPCACHE_MAX_ACCELERATED_FILES
           value: "10000"
         volumeMounts:
-        - name: nextcloud-data
+        - name: nextcloud-root
           mountPath: /var/www/html
-        - name: php-fpm-config
-          mountPath: /usr/local/etc/php-fpm.d/ # Replace with your PHP-FPM config directory
-          subPath: php-fpm.conf
         readinessProbe:
           exec:
             command:
@@ -387,12 +400,8 @@ spec:
           timeoutSeconds: 5        # Timeout for each check
           failureThreshold: 3      # Number of failures before restarting
       volumes:
-      - name: nextcloud-data
-        emptyDir: {} # Temporary storage for testing purposes
-      - name: php-fpm-config
-        configMap:
-          name: php-fpm-config
-
+      - name: nextcloud-root
+        emptyDir: {}
 ---
 # Nextcloud Service
 apiVersion: v1
@@ -458,6 +467,62 @@ spec:
     targetPort: 9980
   type: ClusterIP
 ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-webui-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: open-webui
+  template:
+    metadata:
+      labels:
+        app: open-webui
+    spec:
+      containers:
+      - name: open-webui
+        image: ghcr.io/open-webui/open-webui:main
+        ports:
+        - containerPort: 8080
+        env:
+        - name: OLLAMA_BASE_URL
+          value: "http://ollama-service.open-webui.svc.cluster.local:11434"
+        tty: true
+        volumeMounts:
+        - name: webui-volume
+          mountPath: /app/backend/data
+      volumes:
+      - name: webui-volume
+        persistentVolumeClaim:
+          claimName: open-webui-pvc  
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: open-webui-pvc  
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 4Gi
+---
+# Open web ui service
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-webui
+spec:
+  selector:
+    app: open-webui
+  ports:
+  - protocol: TCP
+    port: 8080
+    targetPort: 8080
+  type: ClusterIP
+---
 # Nextcloud Ingress
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -471,11 +536,6 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
     nginx.ingress.kubernetes.io/enable-gzip: "true"
-    nginx.ingress.kubernetes.io/configuration-snippet: |
-      gzip on;
-      gzip_types text/plain application/json application/javascript text/css text/xml application/xml application/xml+rss text/javascript image/svg+xml;
-      gzip_proxied any;
-      gzip_comp_level 6;
 spec:
   rules:
   - host: nextcloud.abd # Replace this with your actual domain or subdomain
@@ -488,6 +548,7 @@ spec:
             name: nextcloud
             port:
               number: 80
+---
 # Collabora Ingress
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -508,3 +569,25 @@ spec:
             name: collabora
             port:
               number: 9980
+---
+# Openwebui Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: openwebui-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m" # Allow uploads up to 10GB
+spec:
+  rules:
+  - host: openwebui.abd # Replace with your domain or subdomain
+    http:
+      paths:
+      - pathType: Prefix
+        path: /
+        backend:
+          service:
+            name: open-webui
+            port:
+              number: 8080
+---
